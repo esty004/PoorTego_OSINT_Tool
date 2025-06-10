@@ -4,8 +4,8 @@ import os
 from dotenv import load_dotenv
 import sqlite3
 import json
-# Importa il modulo anagrafica adattato per Sanctions.network
-from modules.m1_anagrafica import search_opensanctions  # <--- IMPORT ADATTATO
+# Importa la funzione orchestratrice del modulo anagrafica
+from modules.m1_anagrafica import get_identita_anagrafica  # <--- MODIFICATO IMPORT
 
 load_dotenv()
 app = Flask(__name__)
@@ -82,6 +82,7 @@ def process_osint_data():
         
         nome = data.get('nome')
         cognome = data.get('cognome')
+        # varianti = data.get('varianti')  # Per uso futuro
         subject_identifier = f"{nome} {cognome}".strip() if nome and cognome else "Soggetto Sconosciuto"
         
         log_audit_event(
@@ -105,28 +106,29 @@ def process_osint_data():
             notes="Avvio pipeline di analisi OSINT"
         )
         
-        # --- MODULO ANAGRAFICA (Sanctions.network) ---
-        if nome and cognome:  # Esegui solo se abbiamo nome e cognome
+        # --- MODULO M1: IDENTITÀ E ANAGRAFICA ---
+        if nome and cognome:
             log_audit_event(
                 event_type="AVVIO_MODULO",
-                source_module="M1_Anagrafica_SanctionsNetwork",  # <--- AGGIORNATO
+                source_module="M1_Identita_Anagrafica",
                 target_subject_name=subject_identifier,
-                query_details={"nome": nome, "cognome": cognome}
+                query_details={"nome": nome, "cognome": cognome}  # Aggiungere varianti se usate
             )
             
-            sanctions_results = search_opensanctions(nome, cognome)
-            all_results["sanctions_network"] = sanctions_results  # <--- AGGIORNATO
+            # Chiama la funzione orchestratrice del modulo M1
+            m1_results = get_identita_anagrafica(nome, cognome)  # Passare varianti se implementato
+            all_results["m1_identita_anagrafica"] = m1_results
             
             log_audit_event(
                 event_type="COMPLETAMENTO_MODULO",
-                source_module="M1_Anagrafica_SanctionsNetwork",  # <--- AGGIORNATO
+                source_module="M1_Identita_Anagrafica",
                 target_subject_name=subject_identifier,
-                result_summary=f"Status: {sanctions_results['status']}. Trovati: {sanctions_results.get('count', 0)} risultati.",
+                result_summary=f"Completato. Sanctions.network: {m1_results['sanctions_network'].get('count', 0)} | Google Dorks: {m1_results['google_dorks_anagrafica'].get('count', 0)}"
             )
 
-            # Salva i risultati nel DB
-            if sanctions_results["status"] == "successo" and sanctions_results["results"]:
-                for res_item in sanctions_results["results"]:
+            # Salva i risultati di Sanctions.network nel DB
+            if m1_results["sanctions_network"]["status"] == "successo" and m1_results["sanctions_network"]["results"]:
+                for res_item in m1_results["sanctions_network"]["results"]:
                     # Determina il punteggio di affidabilità basato su diversi fattori
                     reliability_score = "A"  # Default alta affidabilità
                     
@@ -148,24 +150,46 @@ def process_osint_data():
                         reliability_score=reliability_score,
                         content_data=res_item
                     )
+
+            # Salva i risultati dei Google Dorks nel DB
+            # Questi sono URL, quindi l'affidabilità è C finché non vengono analizzati manualmente
+            if m1_results["google_dorks_anagrafica"]["status"] == "successo" and m1_results["google_dorks_anagrafica"]["results"]:
+                for res_item in m1_results["google_dorks_anagrafica"]["results"]:
+                    if "url_found" in res_item:  # Salva solo se c'è un URL, non errori
+                        save_result(
+                            target_subject_name=subject_identifier,
+                            data_category="anagrafica_google_dork_url",
+                            source_api="GoogleDorks",
+                            reliability_score="C",  # URL grezzo, richiede verifica
+                            content_data=res_item  # Contiene dork_query e url_found
+                        )
             
-            # Log aggiuntivo per risultati vuoti o errori
-            elif sanctions_results["status"] == "vuoto":
+            # Log aggiuntivi per risultati vuoti o errori - Sanctions.network
+            if m1_results["sanctions_network"]["status"] == "vuoto":
                 log_audit_event(
                     event_type="RISULTATO_VUOTO",
-                    source_module="M1_Anagrafica_SanctionsNetwork",
+                    source_module="M1_Sanctions_Network",
                     target_subject_name=subject_identifier,
                     result_summary="Nessun risultato trovato su Sanctions.network"
                 )
-            elif sanctions_results["status"] == "errore":
+            elif m1_results["sanctions_network"]["status"] == "errore":
                 log_audit_event(
                     event_type="ERRORE_MODULO",
-                    source_module="M1_Anagrafica_SanctionsNetwork",
+                    source_module="M1_Sanctions_Network",
                     target_subject_name=subject_identifier,
-                    result_summary=f"Errore API: {sanctions_results.get('message', 'Errore sconosciuto')}"
+                    result_summary=f"Errore API: {m1_results['sanctions_network'].get('message', 'Errore sconosciuto')}"
                 )
-        
-        # --- FINE MODULO ANAGRAFICA ---
+            
+            # Log aggiuntivi per risultati vuoti o errori - Google Dorks
+            if m1_results["google_dorks_anagrafica"]["status"] == "vuoto":
+                log_audit_event(
+                    event_type="RISULTATO_VUOTO",
+                    source_module="M1_Google_Dorks",
+                    target_subject_name=subject_identifier,
+                    result_summary="Nessun URL trovato tramite Google Dorks"
+                )
+                
+        # --- FINE MODULO M1 ---
         # Qui verranno aggiunte le chiamate ad altri moduli
         
         response_data = {
